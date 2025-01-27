@@ -1,8 +1,12 @@
-from ryu.base import app_manager
+import ipaddress
+from ryu.base import app_manager 
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import ipv4
 
 class SimpleSDNController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -10,7 +14,14 @@ class SimpleSDNController(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SimpleSDNController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}  # Stores MAC-to-port mappings
-    
+        self.packet_count_host = {}  # Stores packets count per host
+        self.packet_count_port = {}  # Stores packets count per port
+        self.subnet = ipaddress.IPv4Network('10.0.0.0/24', strict=False)
+
+    def _is_same_subnet(self, ip1, ip2):
+        """Checks if two IPs are in the same subnet."""
+        return ipaddress.IPv4Address(ip1) in self.subnet and ipaddress.IPv4Address(ip2) in self.subnet
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         """Handles initial connection with a switch."""
@@ -45,16 +56,46 @@ class SimpleSDNController(app_manager.RyuApp):
         in_port = msg.match['in_port']
 
         # Extract packet data
-        pkt = msg.data
-        self.logger.info("Packet received on port %s", in_port)
+        pkt = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        
+        if eth_pkt:
+            self.logger.info("Packet received on port %s", in_port)
+            # Handle IPv4 packets
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            if ip_pkt:
+                src_ip = ip_pkt.src
+                dst_ip = ip_pkt.dst
 
-        # Process the packet (e.g., forward or drop based on custom logic)
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=pkt
-        )
-        datapath.send_msg(out)
+                # Traffic monitoring: Track packets per host
+                if src_ip not in self.packet_count_host:
+                    self.packet_count_host[src_ip] = 0
+                self.packet_count_host[src_ip] += 1
+
+                # Traffic monitoring: Track packets per port
+                if in_port not in self.packet_count_port:
+                    self.packet_count_port[in_port] = 0
+                self.packet_count_port[in_port] += 1
+
+                # Check if source and destination IPs are in the same subnet
+                if self._is_same_subnet(src_ip, dst_ip):
+                    # Forward the packet
+                    actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+                else:
+                    # Drop the packet if the IPs are in different subnets
+                    self.logger.info("Dropping packet between different subnets: %s -> %s", src_ip, dst_ip)
+                    return  # Return early without sending any output
+                
+                # Create and send the packet-out message
+                out = parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=msg.buffer_id,
+                    in_port=in_port,
+                    actions=actions,
+                    data=msg.data
+                )
+                datapath.send_msg(out)
+            else:
+                self.logger.info("Non-IP packet received on port %s", in_port)
+        else:
+            self.logger.info("Non-Ethernet packet received on port %s", in_port)
